@@ -93,7 +93,7 @@ This directory contains the [Flask app](https://flask.palletsprojects.com/en/2.3
 12. Access the web application in your browser to browse news reports, view associated locations on an interactive world map, and monitor report status through the provided graph.
 
 ## Authors
-- [Mohamed Ahmed](https://github.com/mk-khalil)
+- [Mohamed Ahmed](https://github.com/mahmedken)
 - [Khaled El Bastawesy](https://github.com/khaledElbastawisy)
 - [Hazem Tarek](https://github.com/HazemTarek1080)
 
