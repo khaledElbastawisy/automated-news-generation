@@ -2,6 +2,8 @@ import time
 from pymongo import MongoClient
 from pymongo.operations import UpdateOne
 from cluster import BERTopicModel
+import chromadb
+import numpy as np # Import numpy for potential use with embeddings if not already imported
 
 class TwitterClustering:
     def __init__(self):
@@ -13,6 +15,17 @@ class TwitterClustering:
         self.db = self.client["twitter_data"]
         self.tweet_filtered = self.db["tweet_filtered"]
         self.topic_status_change = self.db['topic_status_change']
+        
+        # Initialize ChromaDB client
+        try:
+            self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
+            print("ChromaDB: Initialized persistent client at ./chroma_db")
+        except Exception as e:
+            print(f"ChromaDB: Failed to initialize persistent client: {e}. Falling back to in-memory.")
+            self.chroma_client = chromadb.Client() # In-memory fallback
+        self.chroma_collection = self.chroma_client.get_or_create_collection(name="tweet_rag_embeddings")
+        print(f"ChromaDB: Collection 'tweet_rag_embeddings' loaded/created. Total items: {self.chroma_collection.count()}")
+
 
     def get_unclustered_tweets(self):
         """
@@ -39,16 +52,70 @@ class TwitterClustering:
             print("No tweets to cluster.")
             return None
         
+        # tweets_to_cluster is a list of dicts, e.g. [{'_id': ObjectId('...'), 'text': '...'}, ...]
+        # It's what BERTopicModel expects for its `tweet_dict` argument.
+        
         clusterModel = BERTopicModel('cluster_model')
-        tweet_id_label, topic_info = clusterModel.online_topic_modeling(tweets_to_cluster)
+        # `online_topic_modeling` now returns (processed_tweets_data, topic_info)
+        # `processed_tweets_data` is [{ "tweet_id": ..., "text": ..., "topic_label": ..., "embedding": ...}, ...]
+        # `tweets_to_cluster` (which becomes `tweet_id_label` in old code) is passed to BERTopic and modified in place for topic labels.
+        # The original `tweets_to_cluster` list of dicts will have 'topic_label' added/updated by BERTopicModel.
+        
+        processed_tweets_data, topic_info = clusterModel.online_topic_modeling(tweets_to_cluster)
         clusterModel.save_model()
 
-        operations = [
-            UpdateOne({'_id': d['_id']}, {'$set': {'topic_label': d['topic_label']}})
-            for d in tweet_id_label
-        ]
-        result = self.tweet_filtered.bulk_write(operations)
-        print(f"Number of tweets clustered: {result.modified_count}")
+        # MongoDB update operations using the original tweets_to_cluster list,
+        # which should have been updated with topic_label by BERTopicModel.
+        operations = []
+        if tweets_to_cluster: # Ensure it's not empty
+            operations = [
+                UpdateOne({'_id': d['_id']}, {'$set': {'topic_label': d.get('topic_label', -2)}}) # Use .get for safety
+                for d in tweets_to_cluster # This is the original list of dicts passed to BERTopic
+            ]
+            if operations: # only bulk_write if there are operations
+                result = self.tweet_filtered.bulk_write(operations)
+                print(f"MongoDB: Number of tweets updated with topic_label: {result.modified_count}")
+            else:
+                print("MongoDB: No topic label update operations to perform.")
+        else:
+            print("MongoDB: tweets_to_cluster list was empty, skipping topic_label updates.")
+
+        # Store embeddings in ChromaDB
+        if processed_tweets_data:
+            print(f"ChromaDB: Preparing to add {len(processed_tweets_data)} embeddings.")
+            try:
+                ids_to_add = []
+                embeddings_to_add = []
+                metadatas_to_add = []
+                
+                for tweet_data in processed_tweets_data:
+                    tweet_id_str = str(tweet_data['tweet_id'])
+                    # Ensure embedding is a list of floats
+                    embedding_list = np.array(tweet_data['embedding']).astype(float).tolist()
+
+                    ids_to_add.append(tweet_id_str)
+                    embeddings_to_add.append(embedding_list)
+                    metadatas_to_add.append({
+                        "tweet_id": tweet_id_str,
+                        "topic_label": str(tweet_data['topic_label']),
+                        "text": tweet_data['text']
+                    })
+
+                if ids_to_add:
+                    self.chroma_collection.add(
+                        ids=ids_to_add,
+                        embeddings=embeddings_to_add,
+                        metadatas=metadatas_to_add
+                    )
+                    print(f"ChromaDB: Successfully added {len(ids_to_add)} embeddings. Collection count: {self.chroma_collection.count()}")
+                else:
+                    print("ChromaDB: No valid data to add.")
+
+            except Exception as e:
+                print(f"ChromaDB: Error adding embeddings: {e}")
+        else:
+            print("ChromaDB: No processed tweet data with embeddings to add.")
+            
         return topic_info
 
     def topics_to_delete(self, new_topic_dict):

@@ -129,13 +129,66 @@ class BERTopicModel(TopicModeling):
         topic_list = [{'topic_label': key, 'size': topic_sizes[key], 'coordinates': topic_coordinates[key], 'keywords': topic_keywords[key]} for key in topic_keywords]
         topic_stats = {'time': current_time, 'topics': topic_list}
 
-        for d in tweet_dict:
-            d.pop('text', None)
+        # Store original texts before popping them
+        original_tweet_texts = [d['text'] for d in tweet_dict]
 
-        for d, value in zip(tweet_dict, self.model.topics_):
-            d['topic_label'] = value
+        # Generate embeddings for original texts
+        # Ensure the embedding model is available (it should be after _fit or _partial_fit)
+        if hasattr(self.model, 'embedding_model') and self.model.embedding_model is not None:
+            tweet_embeddings = self.model.embedding_model.encode(original_tweet_texts)
+        else:
+            # Fallback or error handling if embedding_model is not found
+            # This might happen if the model was loaded without its embedding component
+            # or if it's a very custom BERTopic setup.
+            # For now, we'll create zero vectors as placeholders, but ideally, this should be an error.
+            print("Warning: BERTopic embedding model not found. Using zero vectors for embeddings.")
+            # Assuming "all-MiniLM-L6-v2" as default, its dimension is 384
+            # If a different model is used, this dimension might be incorrect.
+            default_embedding_dim = 384 
+            try:
+                if self.model.embedding_model is not None : # Check if it exists but was not used above
+                    # Attempt to get embedding dimension from the model if possible
+                    # This is a best-effort guess; specific model APIs vary.
+                    if hasattr(self.model.embedding_model, 'get_sentence_embedding_dimension'):
+                        default_embedding_dim = self.model.embedding_model.get_sentence_embedding_dimension()
+                    elif hasattr(self.model.embedding_model, 'model') and hasattr(self.model.embedding_model.model, 'get_sentence_embedding_dimension'): # For SentenceTransformer directly
+                        default_embedding_dim = self.model.embedding_model.model.get_sentence_embedding_dimension()
 
-        return tweet_dict, topic_stats
+            except Exception:
+                pass # Stick to default 384 if introspection fails
+            
+            tweet_embeddings = [([0.0] * default_embedding_dim) for _ in original_tweet_texts]
+
+
+        processed_tweets_data = []
+        for i, d_input in enumerate(tweet_dict):
+            # Assign topic label
+            # self.model.topics_ contains the topic for each document processed in the last partial_fit call
+            # The order should correspond to the input order of textlist
+            topic_label = self.model.topics_[i] if i < len(self.model.topics_) else -2 # -2 for error/unknown
+
+            processed_tweets_data.append({
+                "tweet_id": d_input['_id'], 
+                "text": original_tweet_texts[i],
+                "topic_label": topic_label,
+                "embedding": tweet_embeddings[i] 
+            })
+            # d_input.pop('text', None) # Remove original text from dict that might be saved to mongo via tweet_id_label if it's the same dict
+
+        # The original tweet_dict (which is tweet_id_label in tweet_cluster.py) needs topic_label for MongoDB update
+        # Ensure the original tweet_dict items are updated if they are the same objects
+        # that will be used later for MongoDB updates.
+        # The current structure of online_topic_modeling modifies tweet_dict items by reference for topic_label.
+        # Let's make sure this happens correctly.
+        for i, d_original in enumerate(tweet_dict):
+            d_original['topic_label'] = self.model.topics_[i] if i < len(self.model.topics_) else -2
+            # We no longer pop 'text' here as 'processed_tweets_data' holds the full data for RAG
+            # and 'tweet_dict' (tweet_id_label) is used for MongoDB updates which might still need 'text' or other fields.
+            # If 'text' is not needed for MongoDB update, it can be popped.
+            # For safety, let's assume it might be needed for now or that popping it is handled by the caller if necessary.
+
+
+        return processed_tweets_data, topic_stats
 
     def save_model(self):
         """
